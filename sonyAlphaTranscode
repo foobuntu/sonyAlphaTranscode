@@ -1,0 +1,230 @@
+#!/bin/bash
+
+
+while getopts i:x:y:r:o: option
+do
+	case "${option}"
+		in
+
+		i) INPUT_OPT=${OPTARG};; ### directory of the files to be transcoded
+		x) RES_X_OPT=${OPTARG};; ### resolution x of the transcoded file, use parameter to override values from xml
+		y) RES_Y_OPT=${OPTARG};; ### resolution y of the transcoded file, use parameter to override values from xml
+		r) FRAMERATE_OPT=${OPTARG};;
+        o) OUTPUTDIR_OPT=${OPTARG};; ### optional output directory
+		p) PROXY_OPT='true';;
+	esac
+done
+
+# fallback video dimensions
+RES_X_OPT=${RES_X_OPT:-1920}
+RES_Y_OPT=${RES_Y_OPT:-1080}
+
+FRAMERATE_OPT=${FRAMERATE_OPT:-25}
+
+ENCODE_PROXY='false'
+if [[ $PROXY_OPT == 'true' ]]; then
+	ENCODE_PROXY='true'
+fi
+
+### create OUTPUTDIR if given and it does not already exists
+if [ -n $OUTPUTDIR_OPT ]
+then
+	LAST_CHAR="${OUTPUTDIR_OPT: -1}"
+	if [ $LAST_CHAR != '/' ]; then
+		OUTPUTDIR="$OUTPUTDIR_OPT/"
+	else
+		OUTPUTDIR=$OUTPUTDIR_OPT
+	fi
+	mkdir -p $OUTPUTDIR
+fi
+
+FHD_10_BIT_ARR=(175 185 365 440)
+FHD_8_BIT_ARR=(115 120 145 175 185 220 240 290 365 440)
+
+for FILE in ${INPUT_OPT:?can not be empty}*.MP4
+do
+	FULLFILENAME=$(basename -- "$FILE")
+	FILENAME="${FULLFILENAME%.*}"
+	EXTENSION="${FULLFILENAME##*.}"
+
+	TIMECODE=$(ffprobe -hide_banner -loglevel panic -i $FULLFILENAME -show_streams -select_streams 2 | grep "TAG:timecode")
+	TIMECODE=${TIMECODE:13}
+	TIMECODE_FOR_FILENAME=${TIMECODE//:/-} ### replace all : with - in $TIMECODE
+
+	XMLFILE="$INPUT_OPT$FILENAME*.XML" ### matching xml file for FILE
+	FPS_XML=$(xpath -e 'string(/NonRealTimeMeta/VideoFormat/VideoFrame/@captureFps)' $XMLFILE 2>/dev/null)
+	FPSCLEAN=${FPS_XML::-1} ### trim last character from FPS_XML
+
+	### update FRAMERATE to xml value if available
+	if [ -n $FPSCLEAN ]
+	then
+		FRAMERATE=$FPSCLEAN
+	fi
+
+	### get the pixel format of input file and check for 8 or 10 bit
+	PIXEL_FORMAT_INPUT=$(ffprobe -hide_banner -loglevel panic -i $FULLFILENAME -show_streams -select_streams 0 | grep "pix_fmt")
+	PIXEL_FORMAT_INPUT=${PIXEL_FORMAT_INPUT:8}
+	PIXEL_FORMAT_REGEX="([a-z]+)([0-9]{3})p([0-9]+)?"
+	[[ $PIXEL_FORMAT_INPUT =~ $PIXEL_FORMAT_REGEX ]]
+
+	### set to 10 bit if file is not 8bit. this caps bit depth > 10 bit down to 10 bit
+	### TODO: read out exact bit depth and allow for various bit depth other than 8 or 10
+	IS_10_BIT='false'
+	if [[ -n ${BASH_REMATCH[3]} ]]; then
+		IS_10_BIT='true'
+	fi
+
+	### get bit rate
+	BIT_RATE_INPUT=$(ffprobe -hide_banner -loglevel panic -i $FULLFILENAME -show_streams -select_streams 0 | grep "^bit_rate")
+	BIT_RATE_INPUT=${BIT_RATE_INPUT:9}
+	BIT_RATE_INPUT=$(( BIT_RATE_INPUT / 1000000 ))
+
+	### get ENCODE_BIT_RATE
+	if [[ $IS_10_BIT == 'true' ]]; then
+		# use FHD_10_BIT_ARR
+		LENGTH=${#FHD_10_BIT_ARR[@]}
+
+		if [[ $ENCODE_PROXY == 'true' ]]; then
+			# get proxy encode bit rate
+			for (( i = 0; i < $LENGTH; i++ ));
+			do
+				if [ ${FHD_10_BIT_ARR[$i]} -gt $BIT_RATE_INPUT ]; then
+					if [ $i -eq 0 ]; then
+						ENCODE_BIT_RATE=${FHD_10_BIT_ARR[0]}
+					else
+						ENCODE_BIT_RATE=${FHD_10_BIT_ARR[(($i - 1))]} # get element 1 below the current iterator to get the proxy bit rate
+					fi
+					break
+				fi
+			done
+		else
+			# get high quality bit rate
+			for (( i = 0; i < $LENGTH; i++ ));
+			do
+				if [ ${FHD_10_BIT_ARR[$i]} -gt $BIT_RATE_INPUT ]; then
+					ENCODE_BIT_RATE=${FHD_10_BIT_ARR[$i]}
+					break
+				fi
+			done
+
+			if [ -z $ENCODE_BIT_RATE ]; then
+				ENCODE_BIT_RATE=${FHD_10_BIT_ARR[((LENGTH - 1))]} # use the highest bit rate if no match was found while looping
+			fi
+		fi
+	else
+		# use FHD_8_BIT_ARR
+		LENGTH=${#FHD_8_BIT_ARR[@]}
+
+		if [[ $ENCODE_PROXY == 'true' ]]; then
+			# get proxy encode bit rate
+			for (( i = 0; i < $LENGTH; i++ ));
+			do
+				if [ ${FHD_10_BIT_ARR[$i]} -gt $BIT_RATE_INPUT ]; then
+					if [ $i -eq 0 ]; then
+						ENCODE_BIT_RATE=${FHD_8_BIT_ARR[0]}
+					else
+						ENCODE_BIT_RATE=${FHD_8_BIT_ARR[(($i - 1))]} # get element 1 below the current iterator to get the proxy bit rate
+					fi
+					break
+				fi
+			done
+		else
+			# get high quality bit rate
+			for (( i = 0; i < $LENGTH; i++ ));
+			do
+				if [ ${FHD_8_BIT_ARR[$i]} -gt $BIT_RATE_INPUT ]; then
+					ENCODE_BIT_RATE=${FHD_8_BIT_ARR[$i]}
+					break
+				fi
+			done
+
+			if [ -z $ENCODE_BIT_RATE ]; then
+				ENCODE_BIT_RATE=${FHD_8_BIT_ARR[((LENGTH - 1))]} # use the highest bit rate if no match was found while looping
+			fi
+		fi
+	fi
+
+	### get gamma type and colorspace
+	GAMMA_XML=$(xpath -e 'string(/NonRealTimeMeta/AcquisitionRecord/Group/Item[@name="CaptureGammaEquation"]/@value)' $XMLFILE 2>/dev/null)
+	COLORSPACE_XML=$(xpath -e 'string(/NonRealTimeMeta/AcquisitionRecord/Group/Item[@name="CaptureColorPrimaries"]/@value)' $XMLFILE 2>/dev/null)
+	GAMMA="$GAMMA_XML+$COLORSPACE_XML"
+
+	### get the dimensions of the video
+	RES_X_XML=$(xpath -e 'string(/NonRealTimeMeta/VideoFormat/VideoLayout/@pixel)' $XMLFILE 2>/dev/null)
+	RES_Y_XML=$(xpath -e 'string(/NonRealTimeMeta/VideoFormat/VideoLayout/@numOfVerticalLine)' $XMLFILE 2>/dev/null)
+
+	### use xml values if available, else use backup values
+	if [ -n $RES_X_XML ] && [ -n $RES_Y_XML ]
+	then
+		SIZE="${RES_X_XML}x${RES_Y_XML}"
+		# SIZE+="x"
+		# SIZE+=""
+	else
+		SIZE="${RES_X_OPT}x${RES_Y_OPT}"
+		# SIZE+="x"
+		# SIZE+="$RES_Y_OPT"
+	fi
+
+	if [ -n $TIMECODE_FOR_FILENAME ]
+	then
+		OUTPUTFILE="${FILENAME}_tc-${TIMECODE_FOR_FILENAME}_|||QUALITY|||_${SIZE}_${FRAMERATE}fps_${GAMMA}_|||BITDEPTH|||.mov"
+	else
+		OUTPUTFILE="${FILENAME}_|||QUALITY|||_${SIZE}_${FRAMERATE}fps_${GAMMA}_|||BITDEPTH|||.mov"
+	fi
+
+	if [ -n $OUTPUTDIR ]
+	then
+		OUTPUTFILE="$OUTPUTDIR$OUTPUTFILE"
+	fi
+
+### ----------------------------------------------------------------------------------------------------
+
+	### setup variables to build transcode command
+	if [[ $IS_10_BIT == 'true' ]]; then
+		# 10 bit
+		PIXFMT_PARAM="-pix_fmt yuv422p10le"
+		OUTPUTFILE=${OUTPUTFILE/|||BITDEPTH|||/10bit422}
+	else
+		# 8 bit
+		PIXFMT_PARAM="-pix_fmt yuv422p"
+		OUTPUTFILE=${OUTPUTFILE/|||BITDEPTH|||/8bit422}
+	fi
+
+	if [[ $SIZE == '3840x2160' ]]; then
+		# UHD
+		# QUALITY_PARAM="-profile:v dnxhr_hqx"
+		# OUTPUTFILE=${OUTPUTFILE/|||QUALITY|||/dnxhr_hqx}
+		if [[ $IS_10_BIT == 'true' ]]; then
+			QUALITY_PARAM="-profile:v dnxhr_hqx"
+			OUTPUTFILE=${OUTPUTFILE/|||QUALITY|||/dnxhr_hqx}
+		else
+			QUALITY_PARAM="-profile:v dnxhr_hq"
+			OUTPUTFILE=${OUTPUTFILE/|||QUALITY|||/dnxhr_hq}
+		fi
+	else
+		# FULL HD
+		if [[ $ENCODE_PROXY == 'true' ]]; then
+			QUALITY_PARAM="-b:v ${ENCODE_BIT_RATE}M"
+			OUTPUTFILE=${OUTPUTFILE/|||QUALITY|||/${ENCODE_BIT_RATE}M}
+		else
+			QUALITY_PARAM="-b:v ${ENCODE_BIT_RATE}M"
+			OUTPUTFILE=${OUTPUTFILE/|||QUALITY|||/${ENCODE_BIT_RATE}M}
+		fi
+	fi
+
+	FILE_PARAM="-i $FILE"
+	CODEC_PARAM="-c:v dnxhd"
+	SIZE_PARAM="-s $SIZE"
+	FRAMERATE_PARAM="-r $FRAMERATE"
+	AUDIO_PARAM="-c:a pcm_s16le"
+	if [ -n $TIMECODE ]; then
+		TIMECODE_PARAM="-timecode $TIMECODE"
+	else
+		TIMECODE_PARAM=""
+	fi
+
+	### build transcode command and execute
+	# echo "ffmpeg ${FILE_PARAM} ${CODEC_PARAM} ${SIZE_PARAM} ${FRAMERATE_PARAM} ${PIXFMT_PARAM} ${QUALITY_PARAM} ${AUDIO_PARAM} ${TIMECODE_PARAM} ${OUTPUTFILE}"
+	eval "ffmpeg -hide_banner" ${FILE_PARAM} ${CODEC_PARAM} ${SIZE_PARAM} ${FRAMERATE_PARAM} ${PIXFMT_PARAM} ${QUALITY_PARAM} ${AUDIO_PARAM} ${TIMECODE_PARAM} ${OUTPUTFILE}
+
+done
